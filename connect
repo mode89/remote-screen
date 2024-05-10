@@ -1,0 +1,123 @@
+#! /usr/bin/env nix-shell
+#! nix-shell -i python3
+#! vi: ft=python
+
+from argparse import ArgumentParser
+from contextlib import contextmanager
+from getpass import getpass
+import re
+import select
+import socketserver as ss
+import subprocess as sp
+import time
+import threading
+
+import paramiko as pm
+
+PORT = 5000
+
+def main():
+    args = parse_args()
+
+    print("Connecting to", args.host, "...")
+    ssh = pm.SSHClient()
+    ssh.set_missing_host_key_policy(pm.AutoAddPolicy())
+    ssh.connect(
+        hostname=args.host,
+        username=args.user,
+        password=getpass("Password: ") if args.password else None)
+    transport = ssh.get_transport()
+
+    with gstreamer_server(ssh):
+        forward_tunnel(args.host, PORT, transport)
+
+        print("Starting client ...")
+        sp.run(["gst-launch-1.0", "-v",
+            "tcpclientsrc",
+                "host=localhost",
+                f"port={PORT}", "!",
+            "h264parse", "!",
+            "avdec_h264", "!",
+            "videoconvert", "!",
+            "autovideosink", "sync=false"],
+            check=True)
+
+def parse_args():
+    parser = ArgumentParser()
+    parser.add_argument("user")
+    parser.add_argument("host")
+    parser.add_argument("--password", action="store_true")
+    return parser.parse_args()
+
+@contextmanager
+def gstreamer_server(ssh):
+    print("Copying server files ...")
+    with ssh.open_sftp() as sftp:
+        sftp.put("shell.nix", "/tmp/remote-screen.nix")
+
+    print("Starting server ...")
+    channel = ssh.get_transport().open_session()
+    channel.get_pty()
+    gstreamer_cmd = ["gst-launch-1.0",
+        "ximagesrc",
+            "display-name=:0",
+            "use-damage=false", "!",
+        "video/x-raw,framerate=10/1", "!",
+        "videoconvert", "!",
+        "x264enc",
+            "tune=zerolatency",
+            "bitrate=1000",
+            "speed-preset=superfast", "!",
+        "tcpserversink", "host=0.0.0.0", f"port={PORT}",
+    ]
+    channel.exec_command(
+        "nix-shell /tmp/remote-screen.nix --run "
+            f"\"{' '.join(gstreamer_cmd)}\"")
+
+    try:
+        print("Waiting for server to start ...")
+        while True:
+            time.sleep(1)
+            _, stdout, _ = ssh.exec_command("netstat -an")
+            output = stdout.read().decode("utf-8")
+            if re.search(f":{PORT} .* LISTEN", output):
+                break
+
+        yield
+    finally:
+        channel.send("\x03")
+        channel.close()
+
+def forward_tunnel(host, port, transport):
+    class Handler(ss.BaseRequestHandler):
+        def handle(self):
+            chan = transport.open_channel(
+                "direct-tcpip",
+                (host, port),
+                self.request.getpeername())
+
+            while True:
+                r, _, _ = select.select([self.request, chan], [], [])
+                if self.request in r:
+                    data = self.request.recv(1024)
+                    if len(data) == 0:
+                        break
+                    chan.send(data)
+                if chan in r:
+                    data = chan.recv(1024)
+                    if len(data) == 0:
+                        break
+                    self.request.send(data)
+
+            chan.close()
+            self.request.close()
+
+    server = ss.ThreadingTCPServer(("localhost", PORT), Handler)
+    server.daemon_threads = True
+    server.allow_reuse_address = True
+    server_thread = threading.Thread(target=server.serve_forever)
+    server_thread.daemon = True
+    server_thread.start()
+
+if __name__ == "__main__":
+    main()
