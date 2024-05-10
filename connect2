@@ -1,0 +1,45 @@
+#! /usr/bin/env nix-shell
+#! nix-shell --packages ffmpeg-full -i python3
+#! vi: ft=python
+
+from argparse import ArgumentParser
+import subprocess as sp
+
+def main():
+    args = parse_args()
+
+    grab_cmd = " ".join([
+        "ffmpeg",
+            "-framerate", "15",
+            "-f", "x11grab",
+            "-i", ":0",
+            "-f", "h264",
+            "-preset", "ultrafast",
+            "-tune", "zerolatency",
+            "-maxrate", "2M",
+            "-bufsize", "1M",
+            "-loglevel", "warning",
+            "-",
+    ])
+
+    play_cmd = " ".join([
+        "ffplay",
+            "-fflags", "nobuffer",
+            "-flags", "low_delay",
+            "-loglevel", "warning",
+            "-",
+    ])
+
+    sp.run(f"ssh {args.user}@{args.host} "
+        f"\'nix-shell --packages ffmpeg-full --run \"{grab_cmd}\"' "
+        f"| nix-shell --packages ffmpeg-full --run \"{play_cmd}\"",
+        shell=True, check=True)
+
+def parse_args():
+    parser = ArgumentParser()
+    parser.add_argument("user")
+    parser.add_argument("host")
+    return parser.parse_args()
+
+if __name__ == "__main__":
+    main()
